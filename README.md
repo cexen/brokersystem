@@ -1,6 +1,6 @@
 # cexen/brokersystem
 
-This is an unofficial fork of [brokersystem · PyPI](https://pypi.org/project/brokersystem/).
+This is an UNOFFICIAL fork of [brokersystem · PyPI](https://pypi.org/project/brokersystem/).
 
 # Broker System
 
