@@ -189,16 +189,18 @@ class Table(ValueTemplate):
     def format_for_output(self, value, uploader):
         format_dict = self.format_dict
         if isinstance(value, pd.DataFrame):
+            df = value
             value = value.to_dict(orient="list")
         elif (isinstance(value, list) and all([isinstance(x, dict) for x in value])) or (isinstance(value, dict) and all([isinstance(x, list) for x in value.values()])):
-            value = pd.DataFrame(value).to_dict(orient="list") 
+            df = pd.DataFrame(value)
+            value = df.to_dict(orient="list") 
         else:
             raise Exception("The return value for table should be given by a list of dict, a dict of list or pandas DataFrame")
-        if self.graph is None and len(value.columns) >= 2:
-            format_dict["@repr"] = {"type": "graph", "key_x": value.columns[0], "key_y": value.columns[1]}
+        if self.graph is None and len(df.columns) >= 2:
+            format_dict["@repr"] = {"type": "graph", "key_x": df.columns[0], "key_y": df.columns[1]}
 
         return value, format_dict
-            
+
 
 class TemplateContainer:
     def __init__(self, item_type):
