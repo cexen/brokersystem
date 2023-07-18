@@ -474,19 +474,23 @@ class Agent:
             threading.Thread(target=self.heartbeat).start()
             if not _automatic:
                 logger.info(f"Agent {self.interface.name} has started. Press return to quit.")
-                input("")
-                self.goodbye()
+                try:
+                    input("")
+                finally:
+                    self.goodbye()
 
     @classmethod
     def start(cls):
         agent_list = []
-        for agent in cls._automatic_built_agents.values():
-            agent.run(_automatic=True)
-            agent_list.append(agent)
-        logger.info(f"Press return to quit.")
-        input("")
-        for agent in agent_list:
-            agent.goodbye()
+        try:
+            for agent in cls._automatic_built_agents.values():
+                agent.run(_automatic=True)
+                agent_list.append(agent)
+            logger.info(f"Press return to quit.")
+            input("")
+        finally:
+            for agent in agent_list:
+                agent.goodbye()
 
     def goodbye(self):
         self.running = False
