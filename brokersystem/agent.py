@@ -1,27 +1,37 @@
-import threading
-import json, traceback, time, importlib, sys, io
-import os, glob, importlib
-from functools import partial
+import importlib
 import inspect
+import io
+import json
+import threading
+import time
+from collections.abc import Callable, Iterable, Mapping
+from datetime import timedelta
+from os import PathLike
+from pathlib import Path
+from types import ModuleType
+from typing import Any, Literal
+
 import pandas as pd
+import PIL.Image
 import requests
 from logzero import logger
-from PIL import Image as PILImage
+
+from . import __version__
 
 
 class ValueTemplate:
-    def __init__(self, unit=None):
+    def __init__(self, unit: str | None = None):
         self.type = self.__class__.__name__.lower()
         self.unit = unit
-        self.constraint_dict = {}
+        self.constraint_dict = dict[str, Any]()
         self.item_type = None
 
-    def set_constraint(self, key, value):
+    def set_constraint(self, key: str, value: Any):
         if value is not None:
             self.constraint_dict[key] = value
 
     @property
-    def format_dict(self):
+    def format_dict(self) -> dict[str, Any]:
         format = {"@type": self.type, "@unit": self.unit}
         if self.item_type == "input":
             format.update(
@@ -31,24 +41,31 @@ class ValueTemplate:
             format.update({})
         return format
 
-    def cast(self, value):
+    def cast(self, value: Any):
         return value
 
-    def format_for_output(self, value, uploader):
+    def format_for_output(
+        self, value: Any, uploader: Callable[[str, bytes], dict[str, Any]]
+    ):
         format_dict = {"@type": self.type, "@unit": self.unit}
         return value, format_dict
 
-    def set_item_type(self, item_type):
+    def set_item_type(self, item_type: str):
         self.item_type = item_type
 
     @classmethod
-    def guess_from_value(self, value, unit_callback_func=None, key=None):
+    def guess_from_value(
+        cls,
+        value: Any,
+        unit_callback_func: Callable[[str], str | None] | None = None,
+        key: str | None = None,
+    ):
         unit = None
         if isinstance(value, (int, float)):
-            if unit_callback_func is not None:
+            if unit_callback_func is not None and key is not None:
                 unit = unit_callback_func(key)
             return Number(value, unit=unit)
-        if isinstance(value, (str)):
+        if isinstance(value, str):
             return String(value)
 
         if (
@@ -61,36 +78,42 @@ class ValueTemplate:
         ):
             if not isinstance(value, pd.DataFrame):
                 value = pd.DataFrame(value)
-            unit_dict = {}
+            unit_dict = dict[str, str | None]()
             for column in value.columns:
-                unit_dict[column] = unit_callback_func(column)
-            option_dict = {}
+                if unit_callback_func is not None and column is not None:
+                    unit_dict[column] = unit_callback_func(column)
+                else:
+                    unit_dict[column] = None
+            graph = None
             if len(value.columns) >= 2:
-                option_dict["graph"] = {"x": value.columns[0], "y": value.columns[1]}
-            return Table(unit_dict=unit_dict, **option_dict)
+                graph = {"x": value.columns[0], "y": value.columns[1]}
+            return Table(unit_dict=unit_dict, graph=graph)
 
-        if isinstance(value, (list)):
-            return Choice()
+        if isinstance(value, list):
+            return Choice(value)
 
         assert False, f"Cannot find a matching value template... {value}:{type(value)}"
 
     @classmethod
-    def from_dict(cls, format_dict, unit_dict):
-        option_dict = {}
-        if format_dict["@type"] == "number":
-            template = Number()
-        if format_dict["@type"] == "string":
-            template = String()
-        if format_dict["@type"] == "choice":
-            template = Choice(format_dict["@constraints"]["choices"])
-        if format_dict["@type"] == "table":
-            unit_dict = {key: unit_dict[key] for key in format_dict["@table"]}
-            if "@repr" in format_dict and format_dict["@repr"]["type"] == "graph":
-                option_dict["graph"] = {
-                    "x": format_dict["@repr"]["key_x"],
-                    "y": format_dict["@repr"]["key_y"],
-                }
-            template = Table(unit_dict=unit_dict, **option_dict)
+    def from_dict(cls, format_dict: dict[str, Any], unit_dict: dict[str, str | None]):
+        match format_dict["@type"]:
+            case "number":
+                template = Number()
+            case "string":
+                template = String()
+            case "choice":
+                template = Choice(format_dict["@constraints"]["choices"])
+            case "table":
+                unit_dict = {key: unit_dict[key] for key in format_dict["@table"]}
+                graph = None
+                if "@repr" in format_dict and format_dict["@repr"]["type"] == "graph":
+                    graph = {
+                        "x": format_dict["@repr"]["key_x"],
+                        "y": format_dict["@repr"]["key_y"],
+                    }
+                template = Table(unit_dict=unit_dict, graph=graph)
+            case _ as unknown_type:
+                raise NotImplementedError(f"Unknown type: {unknown_type}")
         if "@constraints" in format_dict:
             for key, value in format_dict["@constraints"].items():
                 template.set_constraint(key, value)
@@ -101,13 +124,19 @@ class ValueTemplate:
 
 
 class Number(ValueTemplate):
-    def __init__(self, value=None, unit=None, min=None, max=None):
+    def __init__(
+        self,
+        value: int | float | None = None,
+        unit: str | None = None,
+        min: int | float | None = None,
+        max: int | float | None = None,
+    ):
         super().__init__(unit)
         self.set_constraint("default", value)
         self.set_constraint("min", min)
         self.set_constraint("max", max)
 
-    def cast(self, value):
+    def cast(self, value: Any):
         try:
             value = int(value)
         except:
@@ -122,59 +151,79 @@ class Number(ValueTemplate):
 
 
 class Range(ValueTemplate):
-    def __init__(self, range_min=None, range_max=None, unit=None):
+    def __init__(
+        self,
+        range_min: int | float | None = None,
+        range_max: int | float | None = None,
+        unit: str | None = None,
+    ):
         super().__init__(unit)
         self.set_constraint("default", {"min": range_min, "max": range_max})
 
 
 class String(ValueTemplate):
-    def __init__(self, string=None):
+    def __init__(self, string: str | None = None):
         super().__init__()
         self.set_constraint("default", string)
 
 
 class File(ValueTemplate):
-    def __init__(self, file_type=None):
+    def __init__(self, file_type: str):
         super().__init__()
         if file_type in ["png", "jpeg", "gif"]:
             self.type = "image"
         self.file_type = file_type
         self.set_constraint("file_type", file_type)
 
-    def format_for_output(self, value, uploader):
-        format_dict = self.format_dict
-        if isinstance(value, str) and self.type == "image":
-            if self.file_type in ["png", "jpeg"]:
-                img = PILImage.open(value)
-                output = io.BytesIO()
-                img.save(output, format=self.file_type)
-                binary_data = output.getvalue()
-            if self.file_type == "gif":
-                with open(value, "rb") as f:
+    def format_for_output(
+        self,
+        value: PathLike[str] | str,
+        uploader: Callable[[str, bytes], dict[str, Any]],
+    ):
+        try:
+            path = Path(value)
+        except Exception as e:
+            raise TypeError(
+                f"a File value must be a file path but got: {value} (type: {type(value)}); {e}"
+            )
+        match self.type:
+            case "image":
+                match self.file_type:
+                    case "png" | "jpeg":
+                        img = PIL.Image.open(path)
+                        output = io.BytesIO()
+                        img.save(output, format=self.file_type)
+                        binary_data = output.getvalue()
+                    case "gif":
+                        with path.open("rb") as f:
+                            binary_data = f.read()
+                    case _ as unknown_type:
+                        raise NotImplementedError(
+                            f"Unknown image file type: {unknown_type}"
+                        )
+                response = uploader(self.file_type, binary_data)
+                logger.debug("upload result: %s", response)
+                assert "file_id" in response
+                value = response["file_id"]
+            case "file":
+                with path.open("rb") as f:
                     binary_data = f.read()
-            response = uploader(self.file_type, binary_data)
-            print(response)
-            assert "file_id" in response
-            value = response["file_id"]
-        elif isinstance(value, str) and self.type == "file":
-            with open(value, "rb") as f:
-                binary_data = f.read()
-            response = uploader(self.file_type, binary_data)
-            print(response)
-            assert "file_id" in response
-            value = response["file_id"]
-        else:
-            raise
+                response = uploader(self.file_type, binary_data)
+                logger.debug("upload result: %s", response)
+                assert "file_id" in response
+                value = response["file_id"]
+            case _ as unknown_type:
+                raise NotImplementedError(f"Unknown file type: {unknown_type}")
 
-        return value, format_dict
+        return value, self.format_dict
 
 
 class Choice(ValueTemplate):
-    def __init__(self, choices: list, unit=None):
+    def __init__(self, choices: Iterable[int | float | str], unit: str | None = None):
         super().__init__(unit)
-        self.set_constraint("choices", choices)
+        self.set_constraint("choices", list(choices))
 
-    def cast(self, value):
+    def cast(self, value: Any):
         try:
             value = int(value)
         except:
@@ -188,12 +237,16 @@ class Choice(ValueTemplate):
 
 
 class Table(ValueTemplate):
-    def __init__(self, unit_dict: dict, graph: dict = None):
+    def __init__(
+        self,
+        unit_dict: Mapping[str, str | None],
+        graph: Mapping[str, Any] | None = None,
+    ):
         super().__init__(unit=None)
-        self.unit_dict = unit_dict.copy()
+        self.unit_dict = dict(unit_dict)
         self.graph = graph
 
-    def cast(self, value):
+    def cast(self, value: Any):
         return value
 
     @property
@@ -233,13 +286,13 @@ class Table(ValueTemplate):
 
 
 class TemplateContainer:
-    def __init__(self, item_type):
-        self._container_dict = {}
-        self._value_keys = []
-        self._table_keys = []
+    def __init__(self, item_type: str):
+        self._container_dict = dict[str, ValueTemplate]()
+        self._value_keys = set[str]()
+        self._table_keys = set[str]()
         self._item_type = item_type
 
-    def __setattr__(self, key: str, value):
+    def __setattr__(self, key: str, value: Any):
         if key.startswith("_"):
             super().__setattr__(key, value)
             return
@@ -250,24 +303,26 @@ class TemplateContainer:
             return
         self._container_dict[key] = value
         if isinstance(value, Table):
-            if key not in self._table_keys:
-                self._table_keys.append(key)
-        elif key not in self._value_keys:
-            self._value_keys.append(key)
+            self._table_keys.add(key)
+        else:
+            self._value_keys.add(key)
         value.set_item_type(self._item_type)
 
     def _get_template(self):
-        if self._item_type == "input":
-            format_keys = ["@type", "@unit", "@necessity", "@constraints"]
-        if self._item_type == "output":
-            format_keys = ["@type", "@unit", "@repr"]
-        if self._item_type == "condition":
-            format_keys = ["@type", "@unit", "@value"]
-        template_dict = {fkey: {} for fkey in format_keys}
+        match self._item_type:
+            case "input":
+                format_keys = ["@type", "@unit", "@necessity", "@constraints"]
+            case "output":
+                format_keys = ["@type", "@unit", "@repr"]
+            case "condition":
+                format_keys = ["@type", "@unit", "@value"]
+            case _ as unknown_type:
+                raise NotImplementedError(f"Unknown item type: {unknown_type}")
+        template_dict = dict[str, Any](**{fkey: {} for fkey in format_keys})
 
-        template_dict["@keys"] = self._value_keys + self._table_keys
+        template_dict["@keys"] = list(self._value_keys | self._table_keys)
         if len(self._value_keys) > 0:
-            template_dict["@value"] = self._value_keys.copy()
+            template_dict["@value"] = list(self._value_keys)
 
         if len(self._table_keys) > 0:
             template_dict["@table"] = {}  # will be given by Table instance
@@ -289,7 +344,7 @@ class TemplateContainer:
                     template_dict[fkey][key] = fvalue
         return template_dict
 
-    def _load(self, config_dict):
+    def _load(self, config_dict: Mapping[str, Any]):
         for key in config_dict["@keys"]:
             format_dict = {
                 prop_key: config_dict[prop_key][key]
@@ -302,20 +357,20 @@ class TemplateContainer:
                 self, key, ValueTemplate.from_dict(format_dict, config_dict["@unit"])
             )
 
-    def __contains__(self, key):
+    def __contains__(self, key: str):
         return key in self._container_dict
 
-    def __getitem__(self, key):
+    def __getitem__(self, key: str) -> ValueTemplate:
         return self._container_dict[key]
 
 
 class ValueContainer:
-    def __init__(self, value_dict):
-        self._container_dict = value_dict.copy()
+    def __init__(self, value_dict: Mapping[str, Any]):
+        self._container_dict = dict(value_dict)
 
     def __getattr__(self, key: str):
         if key.startswith("_"):
-            return super().__getattr__(key)
+            raise AttributeError(f"{key}")
         return self._container_dict[key]
 
     def __getitem__(self, key: str):
@@ -325,7 +380,7 @@ class ValueContainer:
 class AgentInterface:
     def __init__(self):
         self.secret_token = ""
-        self.name = None
+        self.name: str | None = None
         self.charge = 10000
         self.convention = ""
         self.description = ""
@@ -333,10 +388,10 @@ class AgentInterface:
         self.condition = TemplateContainer("condition")
         self.output = TemplateContainer("output")
 
-    def prepare(self, func_dict):
-        self.func_dict = func_dict.copy()
+    def prepare(self, func_dict: Mapping[str, Callable[..., Any]]):
+        self.func_dict = dict(func_dict)
         if "make_config" not in self.func_dict and (
-            self.secret_token == "" or self.name == None
+            self.secret_token == "" or self.name is None
         ):
             logger.error("Secret_token and name should be specified.")
             return
@@ -347,12 +402,12 @@ class AgentInterface:
             return
         self.make_config()
 
-    def make_config(self, for_registration=False):
+    def make_config(self, for_registration: bool = False):
         if "make_config" in self.func_dict:
             self.func_dict["make_config"]()
             if self.name is None:
                 logger.error("Agent's name should be set in config function")
-        config_dict = {}
+        config_dict = dict[str, Any]()
         for item_type in ["input", "condition", "output"]:
             config_dict[item_type] = getattr(
                 getattr(self, item_type), "_get_template"
@@ -361,17 +416,19 @@ class AgentInterface:
         config_dict["charge"] = self.charge
         if for_registration:
             config_dict["module_version"] = (
-                __version__ if "__version__" in globals() else "-1.0.0"
+                __version__  # pyright: ignore[reportUndefinedVariable]
+                if "__version__" in globals()
+                else "-1.0.0"
             )
             config_dict["convention"] = self.convention
             config_dict["description"] = self.description
 
         return config_dict
 
-    def has_func(self, func_name):
+    def has_func(self, func_name: str) -> bool:
         return func_name in self.func_dict
 
-    def validate(self, input_dict):
+    def validate(self, input_dict: dict[str, Any]):
         template_dict = self.input._get_template()
         msg = "ok"
         for key in template_dict["@keys"]:
@@ -379,17 +436,21 @@ class AgentInterface:
                 try:
                     value = self.input[key].cast(input_dict[key])
                     template_dict[key] = value
-                except [AssertionError, TypeError]:
+                except (AssertionError, TypeError):
                     msg = "need_revision"
         return msg, template_dict
 
-    def cast(self, key, input_value):
+    def cast(self, key: str, input_value: Any):
         if key not in self.input:
             logger.error(f"{key} is not registered as input.")
             raise Exception
         return self.input[key].cast(input_value)
 
-    def format_for_output(self, result_dict, uploader):
+    def format_for_output(
+        self,
+        result_dict: dict[str, Any],
+        uploader: Callable[[str, bytes], dict[str, Any]],
+    ):
         output_dict = {
             "@unit": {},
             "@type": {},
@@ -435,7 +496,7 @@ class AgentInterface:
 class DummyJob:
     _to_show_i_am_job_class = True
 
-    def __init__(self, request_params=None, config=None):
+    def __init__(self, request_params: Any, config: dict[str, str]):
         class DummyAgentInterface:
             def __init__(self):
                 self.secret_token = config["secret_token"]
@@ -448,20 +509,25 @@ class DummyJob:
 
         self._agent = DummyAgent()
 
-    def report(self, msg=None, progress=None, result=None):
+    def report(
+        self,
+        msg: str | None = None,
+        progress: float | None = None,
+        result: dict[str, Any] | None = None,
+    ):
         logger.info(f"[DUMMY JOB] REPORT: {msg}, {progress}, {result}")
 
-    def __getitem__(self, key):
+    def __getitem__(self, key: str):
         return 0
 
-    def __contains__(self, key):
+    def __contains__(self, key: str):
         return True
 
 
 class Job:
     _to_show_i_am_job_class = True
 
-    def __init__(self, agent, negotiation_id, request):
+    def __init__(self, agent: "Agent", negotiation_id: str, request: dict[str, Any]):
         self._agent = agent
         self._negotiation_id = negotiation_id
         self._request = request
@@ -469,8 +535,15 @@ class Job:
         self._status = "init"
         self.id = negotiation_id
 
-    def report(self, msg=None, progress=None, result=None):
-        payload = {"negotiation_id": self._negotiation_id, "status": self._status}
+    def report(
+        self,
+        msg: str | None = None,
+        progress: float | None = None,
+        result: dict[str, Any] | None = None,
+    ):
+        payload = dict[str, Any](
+            negotiation_id=self._negotiation_id, status=self._status
+        )
         if msg is not None:
             payload["msg"] = msg
         if progress is not None:
@@ -486,49 +559,59 @@ class Job:
 
         self._agent.post("report", payload)
 
-    def msg(self, msg):
+    def msg(self, msg: str):
         self.report(msg=msg)
 
-    def progress(self, progress, msg=None):
+    def progress(self, progress: float, msg: str | None = None):
         self.report(progress=progress, msg=msg)
 
     def periodic_report(
-        self, estimated_time=None, interval=2, callback_func=None, **kwargs
+        self,
+        estimated_time: timedelta | float | None = None,
+        interval: timedelta = timedelta(seconds=2),
+        callback_func: Callable[..., str] | None = None,
+        **kwargs: Any,
     ):
         if "start_time" not in kwargs:
-            kwargs["start_time"] = time.time()
+            kwargs["start_time"] = time.perf_counter()
         if self._status not in ["done", "error"]:
             msg = None
             if callback_func is not None:
                 kwargs["callback_func"] = callback_func
                 msg = callback_func(self, **kwargs)
             if estimated_time is not None:
+                if not isinstance(estimated_time, timedelta):
+                    estimated_time = timedelta(seconds=estimated_time)
                 kwargs["estimated_time"] = estimated_time
                 self.progress(
-                    (time.time() - kwargs["start_time"]) / estimated_time, msg=msg
+                    (time.perf_counter() - kwargs["start_time"])
+                    / estimated_time.total_seconds(),
+                    msg=msg,
                 )
             elif msg is not None:
                 self.msg(msg)
-            timer = threading.Timer(interval, self.periodic_report, kwargs=kwargs)
+            timer = threading.Timer(
+                interval.total_seconds(), self.periodic_report, kwargs=kwargs
+            )
             timer.daemon = True
             timer.start()
 
-    def __getitem__(self, key):
+    def __getitem__(self, key: str):
         return self._agent.interface.cast(key, self._request[key])
 
-    def __contains__(self, key):
+    def __contains__(self, key: str):
         return key in self._request
 
-    def _set_status(self, status):
+    def _set_status(self, status: str):
         self._status = status
 
 
 class Agent:
     RESTART_INTERVAL_CRITERIA = 30
     HEARTBEAT_INTERVAL = 2
-    _automatic_built_agents = {}
+    _automatic_built_agents = dict[str, "Agent"]()
 
-    def __init__(self, broker_url):
+    def __init__(self, broker_url: str):
         self._to_show_i_am_agent_instance = True
         self.broker_url = broker_url
         self.access_token = None
@@ -536,13 +619,13 @@ class Agent:
         self.running = False
         self.interface = AgentInterface()
 
-    def run(self, _automatic=False):
+    def run(self, _automatic: bool = False):
         if self.running:
             return
         self.interface.prepare(self.agent_funcs)
         self.auth = self.interface.secret_token
         self.polling_interval = 0
-        self.last_heartbeat = time.time()
+        self.last_heartbeat = time.perf_counter()
         if self.register_config():
             self.running = True
             threading.Thread(target=self.connect, daemon=True).start()
@@ -558,7 +641,7 @@ class Agent:
 
     @classmethod
     def start(cls):
-        agent_list = []
+        agent_list = list[Agent]()
         try:
             for agent in cls._automatic_built_agents.values():
                 agent.run(_automatic=True)
@@ -598,10 +681,16 @@ class Agent:
     def heartbeat(self):
         restart_timer = None
         while self.running:
-            if time.time() - self.last_heartbeat > self.RESTART_INTERVAL_CRITERIA:
+            if (
+                time.perf_counter() - self.last_heartbeat
+                > self.RESTART_INTERVAL_CRITERIA
+            ):
                 if restart_timer is None:
-                    restart_timer = time.time()
-                elif time.time() - restart_timer >= self.RESTART_INTERVAL_CRITERIA:
+                    restart_timer = time.perf_counter()
+                elif (
+                    time.perf_counter() - restart_timer
+                    >= self.RESTART_INTERVAL_CRITERIA
+                ):
                     restart_timer = None
                     logger.info(f"Automatic reconnection...")
                     threading.Thread(target=self.connect, daemon=True).start()
@@ -612,7 +701,7 @@ class Agent:
     def connect(self):
         first_time_flag = True
         while self.running:
-            self.last_heartbeat = time.time()
+            self.last_heartbeat = time.perf_counter()
             try:
                 messages = self.check_msgbox()
                 if first_time_flag:
@@ -624,17 +713,21 @@ class Agent:
                     threading.Thread(
                         target=self.process_message, args=[message], daemon=True
                     ).start()
-            except Exception:
-                logger.exception(traceback.format_exc())
+            except:
+                logger.exception(f"Error occured during the message processing")
             time.sleep(self.polling_interval)
 
-    def check_msgbox(self):
-        response = self.get(f"msgbox")
+    def check_msgbox(self) -> list[Any]:
+        response = self.get("msgbox")
         if len(response) > 0:
-            return response["messages"]
+            messages = response["messages"]
+            assert isinstance(
+                messages, list
+            ), f"Response messages was not a list: {response=}"
+            return messages
         return []
 
-    def process_message(self, message):
+    def process_message(self, message: Mapping[str, Any]):
         try:
             logger.debug(f"Message: {message}")
             if "msg_type" not in message or "body" not in message:
@@ -647,32 +740,35 @@ class Agent:
             if message["msg_type"] == "contract":
                 self.process_contract(message["body"])
         except:
-            logger.exception(traceback.format_exc())
+            logger.exception(f"Error occured during process_message; {message=}")
 
-    def process_negotiation_request(self, msg):
-        negotiation_id = msg["negotiation_id"]
+    def process_negotiation_request(self, body: Mapping[str, Any]):
+        negotiation_id = body["negotiation_id"]
         response = self.interface.make_config()
-        msg = "need_revision"
         self.post(
             "negotiation/response",
-            {"msg": msg, "negotiation_id": negotiation_id, "response": response},
+            {
+                "msg": "need_revision",
+                "negotiation_id": negotiation_id,
+                "response": response,
+            },
         )
 
-    def process_negotiation(self, msg):
-        negotiation_id = msg["negotiation_id"]
+    def process_negotiation(self, body: Mapping[str, Any]):
+        negotiation_id = body["negotiation_id"]
         response = self.interface.make_config()
-        request = msg["request"]
+        request = body["request"]
         msg, input_response = self.interface.validate(request)
         response["input"] = input_response
         if msg == "ok" and self.interface.has_func("negotiation"):
             msg, response = self.interface.func_dict["negotiation"](request, response)
             if msg not in ["ok", "need_revision", "ng"]:
                 logger.exception(
-                    f"Negotation func in {self.interface.name} returns a wrong msg: should be one of 'ok', 'need_revision' or 'ng'"
+                    f"Negotiation func in {self.interface.name} returns a wrong msg: should be one of 'ok', 'need_revision' or 'ng'"
                 )
 
         if msg == "ok" and self.interface.has_func("charge_func"):
-            response["charge"] = int(
+            response["charge"] = round(
                 self.interface.func_dict["charge_func"](input_response)
             )
 
@@ -681,8 +777,8 @@ class Agent:
             {"msg": msg, "negotiation_id": negotiation_id, "response": response},
         )
 
-    def process_contract(self, msg):
-        st = time.time()
+    def process_contract(self, msg: Mapping[str, Any]):
+        st = time.perf_counter()
         negotiation_id = msg["negotiation_id"]
         request = msg["request"]
         job = Job(self, negotiation_id, request)
@@ -698,12 +794,12 @@ class Agent:
             job._set_status("done")
             job.report(msg="Job done.", progress=1, result=result)
         except:
-            logger.exception(traceback.format_exc())
+            logger.exception(f"Error occured during the job execution; {msg=}")
             job._set_status("error")
             job.report(msg="Error occured during the job.", progress=-1)
-        logger.debug(f"{negotiation_id} takes {time.time()-st:.3f} s.")
+        logger.debug(f"{negotiation_id} took {time.perf_counter()-st:.3f} s.")
 
-    def header(self, basic_auth=False, upload=False):
+    def header(self, basic_auth: bool = False, upload: bool = False):
         if upload:
             headers = {}
         else:
@@ -715,7 +811,9 @@ class Agent:
 
         return headers
 
-    def post(self, uri, payload, basic_auth=False):
+    def post(
+        self, uri: str, payload: dict[str, Any], basic_auth: bool = False
+    ) -> dict[str, Any]:
         try:
             response = requests.post(
                 f"{self.broker_url}/api/v1/agent/{uri}",
@@ -731,9 +829,14 @@ class Agent:
         elif response.status_code != 200:
             logger.exception(f"{response.status_code}: {uri} {payload}")
             return {}
-        return response.json()
+        obj = response.json()
+        assert isinstance(obj, dict), f"Response was not a dict: {obj}"
+        assert all(
+            isinstance(k, str) for k in obj.keys()
+        ), f"Some of response keys were not str: {obj.keys()}"
+        return obj
 
-    def get(self, uri, basic_auth=False):
+    def get(self, uri: str, basic_auth: bool = False) -> dict[str, Any]:
         try:
             response = requests.get(
                 f"{self.broker_url}/api/v1/agent/{uri}", headers=self.header(basic_auth)
@@ -752,9 +855,14 @@ class Agent:
                 self.polling_interval += 1
             return {}
         self.polling_interval = 0
-        return response.json()
+        obj = response.json()
+        assert isinstance(obj, dict), f"Response was not a dict: {obj}"
+        assert all(
+            isinstance(k, str) for k in obj.keys()
+        ), f"Some of response keys were not str: {obj.keys()}"
+        return obj
 
-    def upload(self, file_type, binary_data):
+    def upload(self, file_type: str, binary_data: bytes) -> dict[str, Any]:
         file_name = "__file_name__"
         mime_dict = {
             "png": "image/png",
@@ -773,35 +881,42 @@ class Agent:
                 files=files,
             )
         except requests.exceptions.ConnectionError:
+            logger.exception("Cannot connect to the broker system for upload")
             return {}
         return response.json()
 
-    def register_func(self, func_name, func):
+    def register_func(self, func_name: str, func: Callable[..., Any]):
         self.agent_funcs[func_name] = func
 
     ##### wrapper functions #####
-    def config(self, func):
+    def config(self, func: Callable[[], None]):
         def wrapper(*args, **kwargs):
             return func(*args, **kwargs)
 
         self.register_func("make_config", wrapper)
         return wrapper
 
-    def negotiation(self, func):
+    def negotiation(
+        self,
+        func: Callable[
+            [dict[str, Any], dict[str, Any]],
+            tuple[Literal["ok", "need_revision", "ng"], dict[str, Any]],
+        ],
+    ):
         def wrapper(*args, **kwargs):
             return func(*args, **kwargs)
 
         self.register_func("negotiation", wrapper)
         return wrapper
 
-    def charge_func(self, func):
+    def charge_func(self, func: Callable[[dict[str, Any]], int]):
         def wrapper(*args, **kwargs):
             return func(*args, **kwargs)
 
         self.register_func("charge_func", wrapper)
         return wrapper
 
-    def job_func(self, func):
+    def job_func(self, func: Callable[..., dict[str, Any] | None]):
         def wrapper(*args, **kwargs):
             return func(*args, **kwargs)
 
@@ -810,7 +925,7 @@ class Agent:
 
     @classmethod
     def _automatic_run(cls):
-        agent_list = []
+        agent_list = list[Agent]()
         for agent in cls._automatic_built_agents.values():
             agent.run(_automatic=True)
             agent_list.append(agent)
@@ -821,8 +936,8 @@ class Agent:
         return len(cls._automatic_built_agents) > 0
 
     @classmethod
-    def make(cls, name, **agent_kwargs):
-        def make_func(func):
+    def make(cls, name: str, **agent_kwargs: dict[str, Any]):
+        def make_func(func: Callable[..., dict[str, Any] | None]):
             # automatic_flag = "_automatic" in agent_kwargs and agent_kwargs["_automatic"]
             agent = AgentConstructor.make(name=name, job_func=func, kwargs=agent_kwargs)
             # agent.run(_automatic=automatic_flag)
@@ -840,19 +955,23 @@ class Agent:
         return make_func
 
     @classmethod
-    def add_config(cls, broker_url=None, secret_token=None):
-        config_dict = {}
+    def add_config(cls, broker_url: str | None = None, secret_token: str | None = None):
+        config_dict = dict[str, str]()
         if broker_url is not None:
             config_dict["broker_url"] = broker_url
         if secret_token is not None:
             config_dict["secret_token"] = secret_token
 
-        def add_config_func(func):
+        def add_config_func(func: Callable[..., Any]):
             def wrapper(*args, **kwargs):
                 return func(*args, **kwargs)
 
-            wrapper._additional_config = config_dict
-            wrapper._original_keys = list(inspect.signature(func).parameters)
+            wrapper._additional_config = (  # pyright: ignore[reportFunctionMemberAccess]
+                config_dict
+            )
+            wrapper._original_keys = (  # pyright: ignore[reportFunctionMemberAccess]
+                list(inspect.signature(func).parameters)
+            )
             return wrapper
 
         return add_config_func
@@ -875,7 +994,7 @@ class Agent:
         return self.interface.secret_token
 
     @secret_token.setter
-    def secret_token(self, token):
+    def secret_token(self, token: str):
         self.interface.secret_token = token
 
     @property
@@ -883,7 +1002,7 @@ class Agent:
         return self.interface.name
 
     @name.setter
-    def name(self, name):
+    def name(self, name: str):
         self.interface.name = name
 
     @property
@@ -891,7 +1010,7 @@ class Agent:
         return self.interface.convention
 
     @convention.setter
-    def convention(self, convention):
+    def convention(self, convention: str):
         self.interface.convention = convention
 
     @property
@@ -899,7 +1018,7 @@ class Agent:
         return self.interface.description
 
     @description.setter
-    def description(self, description):
+    def description(self, description: str):
         self.interface.description = description
 
     @property
@@ -907,21 +1026,31 @@ class Agent:
         return self.interface.charge
 
     @charge.setter
-    def charge(self, charge):
+    def charge(self, charge: int):
         self.interface.charge = charge
 
 
 class AgentConstructor:
-    def __init__(self, name, job_func, kwargs):
+    def __init__(
+        self,
+        name: str,
+        job_func: Callable[..., dict[str, Any] | None],
+        kwargs: Mapping[str, Any],
+    ):
         self.name = name
         self.job_func = job_func
-        self.kwargs = kwargs.copy()
-        self.config = {}
+        self.kwargs = dict(kwargs)
+        self.config = dict[str, Any]()
         self.config_changed = False
         self.agent = None
 
     @classmethod
-    def make(cls, name, job_func, kwargs):
+    def make(
+        cls,
+        name: str,
+        job_func: Callable[..., dict[str, Any] | None],
+        kwargs: Mapping[str, Any],
+    ):
         constructor = cls(name, job_func, kwargs)
         constructor.load_config()
         constructor.config["name"] = name
@@ -951,6 +1080,8 @@ class AgentConstructor:
                 },
             )
         result = self.job_func(**input_params)
+        if result is None:
+            result = {}
         self.fill_output_format(result)
 
     def fill_input_params(self):
@@ -961,7 +1092,7 @@ class AgentConstructor:
         container = TemplateContainer("input")
         updated = False
         keys_to_remove = set(self.config["input"]["@keys"])
-        default_value_dict = {}
+        default_value_dict = dict[str, Any]()
         for key in self.job_func_keys:
             if key in ["job"]:
                 continue
@@ -994,7 +1125,7 @@ class AgentConstructor:
         self.remove_unused_keys("input", keys_to_remove)
         return default_value_dict
 
-    def merge_config_and_container(self, item_type, container):
+    def merge_config_and_container(self, item_type: str, container: TemplateContainer):
         template_dict = container._get_template()
         for key, value in template_dict.items():
             assert key.startswith("@"), "Property keys should start with @"
@@ -1008,7 +1139,7 @@ class AgentConstructor:
                 s = set(self.config[item_type][key])
                 self.config[item_type][key] = list(s.union(value))
 
-    def remove_unused_keys(self, item_type, keys_to_remove):
+    def remove_unused_keys(self, item_type: str, keys_to_remove: set[str]):
         if len(keys_to_remove) == 0:
             return
         for property_key in self.config[item_type]:
@@ -1022,7 +1153,7 @@ class AgentConstructor:
                     s.discard(key)
                     self.config[item_type][property_key] = list(s)
 
-    def fill_output_format(self, result):
+    def fill_output_format(self, result: dict[str, Any]):
         if "output" not in self.config:
             self.config["output"] = {"@keys": []}
         updated = False
@@ -1052,7 +1183,7 @@ class AgentConstructor:
             self.merge_config_and_container("output", container)
         self.remove_unused_keys("output", keys_to_remove)
 
-    def ask_input_format(self, key):
+    def ask_input_format(self, key: str):
         while True:
             value_type = input(
                 f"Select the value type of \"{key}\" ('n':Number, 's': String, 'c': Choice):"
@@ -1085,15 +1216,15 @@ class AgentConstructor:
             print("")
             return String(string=default_value)
 
-    def ask_output_format(self, key):
-        unit = input(f'Unit of "{key}" (empty if none):')
+    def ask_output_format(self, key: str):
+        unit = input(f'Unit of "{key}" (empty if none) > ')
         print("")
         return unit
 
     def load_config(self):
         self.config_changed = False
         try:
-            with open(self.config_path, "r") as f:
+            with self.config_path.open() as f:
                 self.config = json.load(f)
         except:
             self.config = {}
@@ -1107,20 +1238,19 @@ class AgentConstructor:
         assert charge > 0, "charge should be larger than 0"
         _ = self.fill_config_item("description")
 
-    def fill_config_item(self, key, as_type=str):
+    def fill_config_item(self, key: str, astype: type = str):
         if hasattr(self.job_func, "_additional_config") and key in getattr(
             self.job_func, "_additional_config"
         ):
             self.config[key] = getattr(self.job_func, "_additional_config")[key]
         elif key in self.kwargs:
-            if key in self.config and self.config[key] == as_type(self.kwargs[key]):
+            if key in self.config and self.config[key] == astype(self.kwargs[key]):
                 return self.config[key]
-            self.config[key] = as_type(self.kwargs[key])
+            self.config[key] = astype(self.kwargs[key])
             self.config_changed = True
-
-        if key not in self.config:
+        else:
             user_input = input(f"{key}:")
-            self.config[key] = as_type(user_input)
+            self.config[key] = astype(user_input)
             self.config_changed = True
         return self.config[key]
 
@@ -1134,15 +1264,17 @@ class AgentConstructor:
         for item_type in item_types:
             getattr(self.agent, item_type)._load(self.config[item_type])
 
-    def agent_job_func(self, job):
+    def agent_job_func(self, job: Job):
         assert self.agent is not None, "Agent has not been properly prepared."
         input_params = self.job_to_params(job)
         if "estimated_time" in self.kwargs:
             job.periodic_report(self.kwargs["estimated_time"])
         result = self.job_func(**input_params)
+        if result is None:
+            result = {}
         return result
 
-    def job_to_params(self, job):
+    def job_to_params(self, job: Job):
         input_keys = self.job_func_keys
         params = {key: job[key] for key in input_keys if key in job}
         if "job" in input_keys:
@@ -1150,9 +1282,9 @@ class AgentConstructor:
         return params
 
     def dump_config(self):
-        os.makedirs("configs", exist_ok=True)
+        self.config_path.parent.mkdir(exist_ok=True)
 
-        with open(self.config_path, "w") as f:
+        with self.config_path.open("w") as f:
             json.dump(self.config, f)
         self.config_changed = False
 
@@ -1164,11 +1296,16 @@ class AgentConstructor:
 
     @property
     def config_path(self):
-        return os.path.join("configs", f"{self.name}.json")
+        return Path(f"./configs/{self.name}.json")
 
 
 class Broker:
-    def __init__(self, job=None, broker_url=None, auth=None):
+    def __init__(
+        self,
+        job: Job | None = None,
+        broker_url: str | None = None,
+        auth: str | None = None,
+    ):
         if job is None:
             assert broker_url is not None and auth is not None
             self.broker_url = broker_url
@@ -1177,9 +1314,9 @@ class Broker:
             self.broker_url = job._agent.broker_url
             self.auth = job._agent.interface.secret_token
         else:
-            raise Exception
+            raise TypeError
 
-    def ask(self, agent_id, request):
+    def ask(self, agent_id: str, request: dict[str, Any]) -> dict[str, Any]:
         response = self.negotiate(agent_id, request)
         if "negotiation_id" not in response:
             raise Exception(f"Cannot communicate with Agent {agent_id}")
@@ -1196,15 +1333,15 @@ class Broker:
 
         return result
 
-    def negotiate(self, agent_id, request):
+    def negotiate(self, agent_id: str, request: dict[str, Any]):
         response = self.post("negotiate", {"agent_id": agent_id, "request": request})
         return response
 
-    def contract(self, negotiation_id):
+    def contract(self, negotiation_id: str):
         response = self.post("contract", {"negotiation_id": negotiation_id})
         return response
 
-    def get_result(self, negotiation_id):
+    def get_result(self, negotiation_id: str):
         msg = ""
         while True:
             response = self.get(f"result/{negotiation_id}")
@@ -1225,42 +1362,52 @@ class Broker:
         headers.update({"authorization": f"Basic {self.auth}"})
         return headers
 
-    def post(self, uri, payload):
+    def post(self, uri: str, payload: dict[str, Any]) -> dict[str, Any]:
         try:
-            logger.debug
             response = requests.post(
                 f"{self.broker_url}/api/v1/client/{uri}",
                 json=payload,
                 headers=self.header,
             )
         except requests.exceptions.ConnectionError:
-            logger.exception(traceback.format_exc())
+            logger.exception("Connection error on post request")
+            raise
         if response.status_code != 200:
             logger.exception(response.status_code)
             return {}
-        return response.json()
+        obj = response.json()
+        assert isinstance(obj, dict), f"Response was not a dict: {obj}"
+        assert all(
+            isinstance(k, str) for k in obj.keys()
+        ), f"Some of response keys were not str: {obj.keys()}"
+        return obj
 
-    def get(self, uri):
+    def get(self, uri: str) -> dict[str, Any]:
         try:
             response = requests.get(
                 f"{self.broker_url}/api/v1/client/{uri}", headers=self.header
             )
         except requests.exceptions.ConnectionError:
-            logger.exception(traceback.format_exc())
+            logger.exception("Connection error on get request")
             return {}
 
         if response.status_code != 200:
             logger.exception(response.status_code)
             return {}
-        return response.json()
+        obj = response.json()
+        assert isinstance(obj, dict), f"Response was not a dict: {obj}"
+        assert all(
+            isinstance(k, str) for k in obj.keys()
+        ), f"Some of response keys were not str: {obj.keys()}"
+        return obj
 
 
 class AgentManager:
     WATCHING_INTERVAL = 5
 
-    def __init__(self, dir_path=""):
-        self.dir_path = dir_path
-        self.agents = {}
+    def __init__(self, dir_path: PathLike[str] | str = Path(".")):
+        self.dir_path = Path(dir_path)
+        self.agents = dict[Path, dict[str, Any]]()
         self.start_watching_loop()
 
     def start_watching_loop(self):
@@ -1275,7 +1422,7 @@ class AgentManager:
             self.stop(k)
 
     def dog_watching(self):
-        exisiting_files = set(glob.glob(os.path.join(self.dir_path, "*.py")))
+        exisiting_files = set(self.dir_path.glob("*.py"))
         current_files = set(self.agents.keys())
         new_files = exisiting_files - current_files
         removed_files = current_files - exisiting_files
@@ -1288,7 +1435,7 @@ class AgentManager:
             self.stop(file)
             self.agents.pop(file)
 
-    def run_module(self, module):
+    def run_module(self, module: ModuleType) -> Agent | list[Agent] | None:
         def is_agent(obj):
             return hasattr(obj, "_to_show_i_am_agent_instance")
 
@@ -1301,6 +1448,9 @@ class AgentManager:
         for key in module.__dir__():
             if is_agent(getattr(module, key)):
                 agent = getattr(module, key)
+                assert isinstance(
+                    agent, Agent
+                ), f"Not an Agent instance; {module=}; {key=}; {agent=}"
                 agent.run(_automatic=True)
                 return agent
             elif is_automatic_agent(getattr(module, key)):
@@ -1308,10 +1458,10 @@ class AgentManager:
                 return getattr(agent_class, "_automatic_run")()
         return None
 
-    def load(self, file):
-        self.agents[file] = {"mtime": os.path.getmtime(file)}
+    def load(self, file: Path):
+        self.agents[file] = {"mtime": file.stat().st_mtime}
         try:
-            module_name = file.replace(".py", "").replace(os.path.sep, ".")
+            module_name = file.as_posix().replace(".py", "").replace("/", ".")
             module = importlib.import_module(module_name)
             self.agents[file]["module"] = module
             agent = self.run_module(module)
@@ -1324,29 +1474,36 @@ class AgentManager:
                 else:
                     logger.info(f"Agent {agent.interface.name} has started!")
         except:
-            logger.exception(traceback.format_exc())
+            logger.exception(f"load failed: {file=}")
 
-    def check_for_update(self, file):
+    def check_for_update(self, file: Path):
         try:
-            if os.path.getmtime(file) != self.agents[file]["mtime"]:
-                self.agents[file]["mtime"] = os.path.getmtime(file)
-                if "module" not in self.agents[file]:
-                    self.load(file)
-                    return
-                if "agent" in self.agents[file]:
-                    self.stop(file)
-                    time.sleep(Agent.HEARTBEAT_INTERVAL)
+            mtime = file.stat().st_mtime
+            if mtime == self.agents[file]["mtime"]:
+                return
+            self.agents[file]["mtime"] = mtime
+            if "module" not in self.agents[file]:
+                self.load(file)
+                return
+            if "agent" in self.agents[file]:
+                self.stop(file)
+                time.sleep(Agent.HEARTBEAT_INTERVAL)
 
-                module = importlib.reload(self.agents[file]["module"])
-                self.agents[file]["module"] = module
-                agent = self.run_module(module)
-                if agent is not None:
-                    self.agents[file]["agent"] = agent
+            module = importlib.reload(self.agents[file]["module"])
+            self.agents[file]["module"] = module
+            agent = self.run_module(module)
+            if agent is not None:
+                self.agents[file]["agent"] = agent
+                if isinstance(agent, list):
+                    logger.info(
+                        f"Agent {[x.interface.name for x in agent]} has started!"
+                    )
+                else:
                     logger.info(f"Agent {agent.interface.name} has started!")
         except:
-            logger.exception(traceback.format_exc())
+            logger.exception(f"check_for_update failed: {file=}")
 
-    def stop(self, file):
+    def stop(self, file: Path):
         try:
             if "agent" in self.agents[file]:
                 if isinstance(self.agents[file]["agent"], list):
@@ -1355,13 +1512,28 @@ class AgentManager:
                 else:
                     self.agents[file]["agent"].goodbye()
         except:
-            logger.exception(traceback.format_exc())
+            logger.exception(f"stop failed: {file=}")
 
 
 def batch_run():
     AgentManager()
 
 
-if __name__ == "__main__":
-    if len(sys.argv) == 2 and sys.argv[1] == "batch_run":
+def main():
+    from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
+
+    parser = ArgumentParser(
+        prog="brokersystem",
+        formatter_class=ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("command", choices=["batch_run"], help="Command to run")
+    parser.add_argument(
+        "-v", "--version", action="version", version=f"%(prog)s {__version__}"
+    )
+    args = parser.parse_args()
+    if args.command == "batch_run":
         batch_run()
+
+
+if __name__ == "__main__":
+    main()
