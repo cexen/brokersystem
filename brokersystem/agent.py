@@ -629,7 +629,7 @@ class Agent:
         if self.register_config():
             self.running = True
             threading.Thread(target=self.connect, daemon=True).start()
-            threading.Thread(target=self.heartbeat).start()
+            # threading.Thread(target=self.heartbeat).start()
             if not _automatic:
                 logger.info(
                     f"Agent {self.interface.name} has started. Press return to quit."
@@ -699,16 +699,10 @@ class Agent:
             time.sleep(self.HEARTBEAT_INTERVAL)
 
     def connect(self):
-        first_time_flag = True
         while self.running:
             self.last_heartbeat = time.perf_counter()
             try:
                 messages = self.check_msgbox()
-                if first_time_flag:
-                    first_time_flag = False
-
-                if len(messages) > 0:
-                    pass
                 for message in messages:
                     threading.Thread(
                         target=self.process_message, args=[message], daemon=True
