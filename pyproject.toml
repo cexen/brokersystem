@@ -7,7 +7,7 @@ authors = ["chocolate <you@example.com>"]
 readme = "README.md"
 
 [tool.poetry.dependencies]
-python = "^3.9"
+python = "^3.10"
 requests = "^2.31"
 logzero = "^1.7"
 pandas = "^2.0"
