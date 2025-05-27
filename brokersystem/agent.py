@@ -177,43 +177,43 @@ class File(ValueTemplate):
 
     def format_for_output(
         self,
-        value: PathLike[str] | str,
+        value: bytes | PathLike[str] | str,
         uploader: Callable[[str, bytes], dict[str, Any]],
     ):
-        try:
-            path = Path(value)
-        except Exception as e:
-            raise TypeError(
-                f"a File value must be a file path but got: {value} (type: {type(value)}); {e}"
-            )
-        match self.type:
-            case "image":
-                match self.file_type:
-                    case "png" | "jpeg":
-                        img = PIL.Image.open(path)
-                        output = io.BytesIO()
-                        img.save(output, format=self.file_type)
-                        binary_data = output.getvalue()
-                    case "gif":
-                        with path.open("rb") as f:
-                            binary_data = f.read()
-                    case _ as unknown_type:
-                        raise NotImplementedError(
-                            f"Unknown image file type: {unknown_type}"
-                        )
-                response = uploader(self.file_type, binary_data)
-                logger.debug("upload result: %s", response)
-                assert "file_id" in response
-                value = response["file_id"]
-            case "file":
-                with path.open("rb") as f:
-                    binary_data = f.read()
-                response = uploader(self.file_type, binary_data)
-                logger.debug("upload result: %s", response)
-                assert "file_id" in response
-                value = response["file_id"]
-            case _ as unknown_type:
-                raise NotImplementedError(f"Unknown file type: {unknown_type}")
+        if isinstance(value, bytes | bytearray | memoryview):
+            binary_data = value
+        else:
+            try:
+                path = Path(value)
+            except Exception as e:
+                raise TypeError(
+                    f"a File value must be a file path but got: {value} (type: {type(value)}); {e}"
+                )
+            match self.type:
+                case "image":
+                    match self.file_type:
+                        case "png" | "jpeg":
+                            img = PIL.Image.open(path)
+                            output = io.BytesIO()
+                            img.save(output, format=self.file_type)
+                            binary_data = output.getvalue()
+                        case "gif":
+                            with path.open("rb") as f:
+                                binary_data = f.read()
+                        case _ as unknown_type:
+                            raise NotImplementedError(
+                                f"Unknown image file type: {unknown_type}"
+                            )
+                case "file":
+                    with path.open("rb") as f:
+                        binary_data = f.read()
+                case _ as unknown_type:
+                    raise NotImplementedError(f"Unknown file type: {unknown_type}")
+
+        response = uploader(self.file_type, binary_data)
+        logger.debug("upload result: %s", response)
+        assert "file_id" in response
+        value = response["file_id"]
 
         return value, self.format_dict
 
