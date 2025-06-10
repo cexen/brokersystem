@@ -298,7 +298,8 @@ class TemplateContainer:
             return
         if not isinstance(value, ValueTemplate):
             logger.error(
-                f"You can only set ValueTemplate object(such as Number or Table) for input, condition and output: {key} ({type(value)})"
+                f"You can only set ValueTemplate object(such as Number or Table) for input, condition and output: {key} ({type(value)})",
+                stack_info=True,
             )
             return
         self._container_dict[key] = value
@@ -393,11 +394,12 @@ class AgentInterface:
         if "make_config" not in self.func_dict and (
             self.secret_token == "" or self.name is None
         ):
-            logger.error("Secret_token and name should be specified.")
+            logger.error("Secret_token and name should be specified.", stack_info=True)
             return
         if "job_func" not in self.func_dict:
             logger.error(
-                "job execution function is required: Prepare a decorated function with @job_func."
+                "job execution function is required: Prepare a decorated function with @job_func.",
+                stack_info=True,
             )
             return
         self.make_config()
@@ -406,7 +408,9 @@ class AgentInterface:
         if "make_config" in self.func_dict:
             self.func_dict["make_config"]()
             if self.name is None:
-                logger.error("Agent's name should be set in config function")
+                logger.error(
+                    "Agent's name should be set in config function", stack_info=True
+                )
         config_dict = dict[str, Any]()
         for item_type in ["input", "condition", "output"]:
             config_dict[item_type] = getattr(
@@ -442,7 +446,7 @@ class AgentInterface:
 
     def cast(self, key: str, input_value: Any):
         if key not in self.input:
-            logger.error(f"{key} is not registered as input.")
+            logger.error(f"{key} is not registered as input.", stack_info=True)
             raise Exception
         return self.input[key].cast(input_value)
 
@@ -646,7 +650,7 @@ class Agent:
             for agent in cls._automatic_built_agents.values():
                 agent.run(_automatic=True)
                 agent_list.append(agent)
-            logger.info(f"Press return to quit.")
+            logger.info("Press return to quit.")
             input("")
         finally:
             for agent in agent_list:
@@ -670,12 +674,12 @@ class Agent:
                 logger.debug(f"TOKEN {self.access_token}")
                 return True
             elif "status" in response and response["status"] == "error":
-                logger.error(response["error_msg"])
+                logger.error(response["error_msg"], stack_info=True)
                 break
             else:
                 logger.warning("Cannot connect to the broker system.")
             time.sleep(3)
-        logger.error("Stop try connecting to the broker system.")
+        logger.error("Stop try connecting to the broker system.", stack_info=True)
         return False
 
     def heartbeat(self):
@@ -692,7 +696,7 @@ class Agent:
                     >= self.RESTART_INTERVAL_CRITERIA
                 ):
                     restart_timer = None
-                    logger.info(f"Automatic reconnection...")
+                    logger.info("Automatic reconnection...")
                     threading.Thread(target=self.connect, daemon=True).start()
             else:
                 restart_timer = None
@@ -708,7 +712,7 @@ class Agent:
                         target=self.process_message, args=[message], daemon=True
                     ).start()
             except:
-                logger.exception(f"Error occured during the message processing")
+                logger.exception("Error occured during the message processing")
             time.sleep(self.polling_interval)
 
     def check_msgbox(self) -> list[Any]:
@@ -725,7 +729,7 @@ class Agent:
         try:
             logger.debug(f"Message: {message}")
             if "msg_type" not in message or "body" not in message:
-                logger.exception(f"Wrong message format: {message}")
+                logger.error(f"Wrong message format: {message}", stack_info=True)
                 return
             if message["msg_type"] == "negotiation_request":
                 self.process_negotiation_request(message["body"])
@@ -757,8 +761,9 @@ class Agent:
         if msg == "ok" and self.interface.has_func("negotiation"):
             msg, response = self.interface.func_dict["negotiation"](request, response)
             if msg not in ["ok", "need_revision", "ng"]:
-                logger.exception(
-                    f"Negotiation func in {self.interface.name} returns a wrong msg: should be one of 'ok', 'need_revision' or 'ng'"
+                logger.error(
+                    f"Negotiation func in {self.interface.name} returns a wrong msg: should be one of 'ok', 'need_revision' or 'ng'",
+                    stack_info=True,
                 )
 
         if msg == "ok" and self.interface.has_func("charge_func"):
@@ -821,7 +826,7 @@ class Agent:
             assert self.register_config()
             return self.post(uri, payload)
         elif response.status_code != 200:
-            logger.exception(f"{response.status_code}: {uri} {payload}")
+            logger.error(f"{response.status_code}: {uri} {payload}", stack_info=True)
             return {}
         obj = response.json()
         assert isinstance(obj, dict), f"Response was not a dict: {obj}"
@@ -844,7 +849,7 @@ class Agent:
             assert self.register_config()
             return self.get(uri)
         elif response.status_code != 200:
-            logger.exception(response.status_code)
+            logger.error(response.status_code, stack_info=True)
             if self.polling_interval < 10:
                 self.polling_interval += 1
             return {}
@@ -938,7 +943,8 @@ class Agent:
 
             def wrapper(*args, **kwargs):
                 logger.warning(
-                    "Direct call of the agent job function for the start up will be disabled in future. Change it to Agent.start()."
+                    "Direct call of the agent job function for the start up will be disabled in future. Change it to Agent.start().",
+                    stack_info=True,
                 )
                 cls.start()
                 return agent
@@ -1367,7 +1373,7 @@ class Broker:
             logger.exception("Connection error on post request")
             raise
         if response.status_code != 200:
-            logger.exception(response.status_code)
+            logger.error(response.status_code, stack_info=True)
             return {}
         obj = response.json()
         assert isinstance(obj, dict), f"Response was not a dict: {obj}"
@@ -1386,7 +1392,7 @@ class Broker:
             return {}
 
         if response.status_code != 200:
-            logger.exception(response.status_code)
+            logger.error(response.status_code, stack_info=True)
             return {}
         obj = response.json()
         assert isinstance(obj, dict), f"Response was not a dict: {obj}"
